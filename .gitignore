@@ -1,0 +1,5 @@
+datasets/*
+!datasets/.gitkeep
+
+model_outputs/*
+!model_outputs/.gitkeep
