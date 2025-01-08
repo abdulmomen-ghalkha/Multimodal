@@ -1,5 +1,9 @@
 datasets/*
-!datasets/.gitkeep
+!datasets/
 
 model_outputs/*
-!model_outputs/.gitkeep
+!model_outputs/
+
+
+*.zip
+
