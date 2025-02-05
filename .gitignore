@@ -7,3 +7,8 @@ model_outputs/*
 
 *.zip
 no_comm_outputs/
+
+feature_IID/
+feature_nonIID/
+image_beam/
+pos_height_beam/
