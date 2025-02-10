@@ -12,3 +12,29 @@ feature_IID/
 feature_nonIID/
 image_beam/
 pos_height_beam/
+# Jupyter
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+
+# Visual Studio
+.vscode/
+.vs/
+bin/
+obj/
+*.user
+*.suo
+
+# Python Virtual Environments
+.venv/
+venv/
+
+# Node.js Projects
+node_modules/
+dist/
+build/
+
+# Logs
+*.log
