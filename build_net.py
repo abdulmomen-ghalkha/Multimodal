@@ -294,7 +294,7 @@ class NN_beam_pred(nn.Module):
             
             self.layer_1 = nn.Linear(num_features, node)
             self.layer_2 = nn.Linear(node, node)
-            self.layer_3 = nn.Linear(node, node)
+            self.layer_3 = nn.Linear(node, num_output)
             #self.layer_out = nn.Linear(node, num_output)
             
             self.relu = nn.ReLU()
