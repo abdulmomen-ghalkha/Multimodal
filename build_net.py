@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
 from torch.utils.model_zoo import load_url as load_state_dict_from_url
+import torch.nn.functional as F
 
 # from .utils import load_state_dict_from_url
 
@@ -316,3 +317,213 @@ class MultinomialLogisticRegression(nn.Module):
 
     def forward(self, x):
         return self.linear(x)
+
+# Image Feature Extractor
+class ImageFeatureExtractor(nn.Module):
+    def __init__(self, output_dim=128):
+        super(ImageFeatureExtractor, self).__init__()
+        base_model = resnet50(pretrained=True, num_classes=64)
+        #base_model.fc = nn.Identity()  # Remove classification layer
+        self.feature_extractor = base_model
+        self.fc = nn.Linear(128, output_dim)  # Project to desired output dimension
+        #self.bn = nn.BatchNorm1d(output_dim)
+
+    def forward(self, x):
+        x = self.feature_extractor(x)
+        x = self.fc(x)
+        #x = self.bn(x)
+        return x
+
+# Position Feature Extractor
+class PosFeatureExtractor(nn.Module):
+    def __init__(self, input_dim=4, output_dim=128):
+        super(PosFeatureExtractor, self).__init__()
+        self.feature_extractor = NN_beam_pred(num_features=input_dim, num_output=output_dim)
+        #self.bn = nn.BatchNorm1d(output_dim)
+
+    def forward(self, x):
+        x = self.feature_extractor(x)
+        #x = self.bn(x)
+        return x
+
+class MultiModalNetwork(nn.Module):
+    def __init__(self, input_size_audio=None, input_size_visual=None, hidden_size=256, output_size=64, z_dim=100):
+        super(MultiModalNetwork, self).__init__()
+        
+        self.has_audio = input_size_audio is not None
+        self.has_visual = input_size_visual is not None
+        self.z_dim = z_dim  # Dimensionality of random noise for generator
+        
+        if self.has_audio:
+            # Audio feature extractor
+            self.audio_feature_extractor = PosFeatureExtractor(output_dim=hidden_size)
+            
+            # Common and Specific classifiers for audio
+            self.audio_common_classifier = nn.Linear(hidden_size // 2, output_size)
+            self.audio_specific_classifier = nn.Linear(hidden_size // 2, output_size)
+        
+        if self.has_visual:
+            # Visual feature extractor
+            self.visual_feature_extractor = ImageFeatureExtractor(output_dim=hidden_size)
+
+            # Common and Specific classifiers for visual
+            self.visual_common_classifier = nn.Linear(hidden_size // 2, output_size)
+            self.visual_specific_classifier = nn.Linear(hidden_size // 2, output_size)
+        
+        # Common classifier shared by both modalities
+        self.common_classifier = nn.Linear(hidden_size // 2, output_size)  # Common features
+
+        # Generator Network for learning modality-common features
+        self.generator = nn.Sequential(
+            nn.Linear(z_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size // 2),  # Output common modality features
+        )
+
+    def forward(self, audio_input=None, visual_input=None, z=None):
+        audio_features = self.audio_feature_extractor(audio_input) if self.has_audio and audio_input is not None else None
+        visual_features = self.visual_feature_extractor(visual_input) if self.has_visual and visual_input is not None else None
+
+        common_audio_features = None
+        common_visual_features = None
+        specific_audio_features = None
+        specific_visual_features = None
+        
+        if self.has_audio and audio_features is not None:
+            # Split audio features into common and specific parts
+            common_audio_features = audio_features[:, :audio_features.size(1) // 2]
+            specific_audio_features = audio_features[:, audio_features.size(1) // 2:]
+        
+        if self.has_visual and visual_features is not None:
+            # Split visual features into common and specific parts
+            common_visual_features = visual_features[:, :visual_features.size(1) // 2]
+            specific_visual_features = visual_features[:, visual_features.size(1) // 2:]
+
+        # Generate modality-common features if z is provided (for knowledge distillation)
+        generated_common_features = None
+        generated_common_pred = None
+
+        if z is not None:
+            generated_common_features = self.generator(z)  # Generated audio common features
+            generated_common_pred = self.common_classifier(generated_common_features)  # Generated audio common features
+
+        # Process each modality's common features with their classifiers
+        final_audio_pred = None
+        final_visual_pred = None
+        mean_common_features = 0
+        modality = 0
+
+        if common_audio_features is not None:
+            modality += 1
+            mean_common_features += common_audio_features if mean_common_features is not None else 0
+            common_audio_pred = self.audio_common_classifier(common_audio_features)
+            specific_audio_pred = self.audio_specific_classifier(specific_audio_features)
+            final_audio_pred = common_audio_pred + specific_audio_pred  # Combining both predictions
+
+        if common_visual_features is not None:
+            modality += 1
+            mean_common_features += common_visual_features if mean_common_features is not None else 0
+            common_visual_pred = self.visual_common_classifier(common_visual_features)
+            specific_visual_pred = self.visual_specific_classifier(specific_visual_features)
+            final_visual_pred = common_visual_pred + specific_visual_pred  # Combining both predictions
+
+        # Normalize mean_common_features by the number of contributing modalities
+        if modality > 0:
+            mean_common_features = mean_common_features / modality  
+
+        # Compute final prediction by averaging predictions of all classifiers
+        if final_audio_pred is not None and final_visual_pred is not None:
+            final_prediction = (final_audio_pred + final_visual_pred) 
+        elif final_audio_pred is not None:
+            final_prediction = final_audio_pred
+        elif final_visual_pred is not None:
+            final_prediction = final_visual_pred
+        else:
+            final_prediction = None  # No valid predictions
+
+        
+
+        return final_prediction, (final_audio_pred, final_visual_pred, common_audio_features, common_visual_features, specific_audio_features, specific_visual_features, generated_common_features, generated_common_pred, mean_common_features)
+    def compute_loss(self, audio_input, visual_input, labels, z, alpha1=1.0, alpha2=1.0, alpha_gen=1.0, beta=1.0, alpha_kd=1.0):
+        # Forward pass
+        final_prediction, (final_audio_pred, final_visual_pred, common_audio_features, common_visual_features, specific_audio_features, specific_visual_features, generated_common_features, generated_common_pred, mean_common_features) = self(audio_input, visual_input, z)
+
+        # Initialize losses to zero
+        similarity_loss = 0.0
+        auxiliary_loss = 0.0
+        difference_loss = 0.0
+        generation_loss = 0.0
+        kd_loss = 0.0  # Knowledge Distillation Loss
+
+        # 1) Knowledge Distillation Loss (using the local generator)
+        if common_audio_features is not None:
+            kd_loss += self.compute_knowledge_distillation_loss(common_audio_features, z)
+        if common_visual_features is not None:
+            kd_loss += self.compute_knowledge_distillation_loss(common_visual_features, z)
+
+        # 2) Similarity Loss (F_sim_k)
+        if common_audio_features is not None and common_visual_features is not None:
+            kl_loss_audio = self.compute_kl_divergence(common_audio_features, common_visual_features)
+            similarity_loss = kl_loss_audio / 2  # Normalized by the number of modalities
+
+        # 3) Auxiliary Classification Loss (F_cls_k)
+        if common_audio_features is not None:
+            auxiliary_loss += self.compute_auxiliary_classification_loss(common_audio_features, labels)
+        if common_visual_features is not None:
+            auxiliary_loss += self.compute_auxiliary_classification_loss(common_visual_features, labels)
+
+        # 4) Difference Loss (F_dif_k) - Orthogonality between common and specific features
+        if common_audio_features is not None and specific_audio_features is not None:
+            difference_loss += self.compute_difference_loss(common_audio_features, specific_audio_features)
+        if common_visual_features is not None and specific_visual_features is not None:
+            difference_loss += self.compute_difference_loss(common_visual_features, specific_visual_features)
+
+        # 5) Generation Loss (F_gen_k)
+        if generated_common_features is not None:
+            generation_loss += self.compute_generation_loss(generated_common_features, generated_common_pred, mean_common_features, labels, beta) 
+
+        # 6) Total Loss (F_dec_k)
+        total_loss = alpha1 * similarity_loss + alpha2 * difference_loss + auxiliary_loss + alpha_gen * generation_loss + alpha_kd * kd_loss
+        return total_loss, similarity_loss, auxiliary_loss, difference_loss, generation_loss, kd_loss
+
+    def compute_knowledge_distillation_loss(self, common_features, z):
+        # Generate modality-common features using the local generator (input noise z)
+        generated_features = self.generator(z)  # Generate modality-common features from noise
+    
+        # Pass both real common features and generated features through the common classifier
+        common_features_pred = self.common_classifier(common_features)
+        generated_features_pred = self.common_classifier(generated_features)
+    
+        # Apply softmax to both the predicted features
+        softmax_common_features = F.softmax(common_features_pred, dim=-1)
+        softmax_generated_features = F.softmax(generated_features_pred, dim=-1)
+    
+        # Compute KL divergence between the softmax outputs of the real and generated features
+        kd_loss = F.kl_div(softmax_common_features.log(), softmax_generated_features, reduction='batchmean')
+    
+        return kd_loss
+
+    def compute_kl_divergence(self, common_audio_features, common_visual_features):
+        # Apply softmax to features and compute KL divergence
+        softmax_audio = F.softmax(common_audio_features, dim=-1)
+        softmax_visual = F.softmax(common_visual_features, dim=-1)
+        kl_divergence = F.kl_div(softmax_audio.log(), softmax_visual, reduction='batchmean')
+        return kl_divergence
+
+    def compute_auxiliary_classification_loss(self, common_features, labels):
+        # Cross-entropy loss for auxiliary classification
+        return F.cross_entropy(self.common_classifier(common_features), labels)
+
+    def compute_difference_loss(self, common_features, specific_features):
+        # Orthogonality loss to ensure modality-common and modality-specific features are distinct
+        return torch.norm(torch.matmul(common_features.T, specific_features), p='fro')**2
+
+    def compute_generation_loss(self, generated_common_features, generated_common_pred, mean_common_features, labels, beta):
+        # Mean squared error loss to ensure the generated features align with the true features
+        generated_common_pred = F.softmax(generated_common_pred, dim=-1)
+        return F.cross_entropy(generated_common_pred, labels) + beta * F.mse_loss(generated_common_features, mean_common_features)
+
+
+
